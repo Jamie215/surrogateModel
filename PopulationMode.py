@@ -1,24 +1,41 @@
 import numpy as np
-import matplotlib.pyplot as plot
 import nengo
 import math
-
+from scipy.interpolate import interp1d, interp2d
 class PopulationModeModel(object):    
-    def __init__(self, population):
-        self.pop = population # default LIF Model Population 
-        self.radii = population.max_rates # max amplitude in each dimension
-        self.dim = population.dimensions # dimension of the population 
+    def __init__(self, params):
+        """
+        within params...
+
+        population: desired ensemble that would be represented in this mode
+        rates: firing rates of the neurons within the population
+        decoders: decoding vectors of the neurons within the population
+        """
+        self.pop = params['population'] # default LIF Model Population
+        self.origins = params['origins'] # source of the ideal output
+        self.radii = self.pop.radius # max amplitude in each dimension
+        self.dim = self.pop.dimensions # dimension of the population 
         # a vector that speicfies the origin to which each bias element belongs
-        self.originIndices = self.makeOriginIndices() 
+        self.origin_indices = self.makeOriginIndices()
+        self.trange = params['timerange'] # simulation time range
+        self.dt = params['dt'] # simulation time step
+        
+        self.__bias_points = params['evalpoints'] # x; points from which to interpolate bias
+        self.__rates = params['firingrates'] # f_hat(x) of the population
+        self.__decoders = params['decoders']
+        self.__drive = params['drive']
+        self.__voltage = params['voltage_post']
 
-        # bias grid
-        self.x = []
-        self.y = []
-        self.z = []
+        # Params for bias model
         self.r = [] # For cases higher than 3D
-        self.biasValues = [] # len(originIndices) * bias grid
-        self.biasPoints = [] # points from which to interpolate bias
+        self.bias_values_sim = []
+        self.bias_values_est = [] # Estimated bias term
+        self.ideal_values = []
+        self.actual_values = []
 
+        # Params for noise model
+        self.noise_values_sim = []
+        self.noise_values_est = []
         self.noiseOriginInd = []
         self.noiseCorr = []
 
@@ -33,35 +50,34 @@ class PopulationModeModel(object):
         self.noiseTime = []
         self.noiseSamples = []
 
-
     #########################
     # MAKE HELPER FUNCITONS #
     #########################
 
     def makeOriginIndices(self):
         """
-        generates and returns a list of origin numbers to which each noise value belongs
+        Generates and returns a list of indexes of origin numbers.
 
+        Steps:
+        1. Find the total number of dimensions
+        2. For each origin, record the index of the origin n times, where n is 
+            number of dimensions
+        3. Return the indices
 
         """
-        nTotalDim = self.dim
-        originIndices = np.zeros((1, nTotalDim))
-        print "originIndices.shape: {}".format(originIndices.shape)
-        nOrigin = 1 # TODO: Discard the assumption that there to be only one origin
-        print "len(originIndices): {}".format(len(originIndices))
-        for i in len(2):
-            originIndices[0,i] = self.dim
-        return originIndices
+        nTotalDim = 0
+        for origin in self.origins:
+            nTotalDim += origin.dimensions 
 
-    def makeVector(radius, nPoints):
-        """
-        Creates vector based on the number of points and the radius of 
-        the neural population
+        origin_indices = np.zeros((1, nTotalDim))
+        c = 0
+        for i in range(len(self.origins)):
+            for j in range(c, c+self.origins[i].dimensions):
+                origin_indices[0:j] = i
+            c += self.origins[i].dimensions
 
-        radius:
-        nPoints:
-        """
-        result = np.arange(2*radius/(nPoints), radius)
+        return origin_indices
+
 
     ###########################
     # CREATE HELPER FUNCTIONS #
@@ -69,84 +85,73 @@ class PopulationModeModel(object):
 
     def createBiasModel(self):
         """
-        Creates bias model for estimating the bias term of the surrogate model
+        Creates bias model for estimating the bias term of the surrogate model.
+        
+        Steps:
+        1. Perform interpolation based on the dimension
+        2. Find bias values of the x_intercepts (evalpoints)
+        3. Estimate the bias based on the the bias found from Step 2
+        3. Return the bias values
 
-        biasPoints:
         """
         a = 3 # bias is modelled over a*[-radius radius], this case, [-3 3]
-        self.biasPoints = np.linspace(-3,3,6)
+
+        if self.dim < 4:
+            self.getBiasSamples()
         
-        if self.dim == 1: # linear inperpolation
-            self.x = self.biasPoints
-            self.biasValues = self.getBiasSamples()
-        elif self.dim == 2: # bilinear interpolation
-            nPoints = 101
-            self.x = makeVector(a*self.radii[1], numPoints)
-            self.y = makeVector(a*self.radii[2], numPoints)
-            grid = np.meshgrid(self.x,self.y)
-
-            bv = self.getBiasSamples(np.array(reshape(np.transpose(x),1,
-                    nPoints**2), reshape(np.transpose(y), 1, np^2)))
-            self.biasValues = np.reshape(bv, np.arange(len(self.originIndices), 
-                    nPoints, nPoints))
-        elif self.dim == 3: # trilinear interpolation
-            nPoints = 41
-            x = makeVector(a*self.radii[1], nPoints)
-            y = makeVector(a*self.radii[2], nPoints)
-            z = makeVector(a*self.radii[3], nPoints)
-            grid = np.meshgrid(x, y, z)
-            self.x = np.permute(x, [2,1,3])
-            self.y = np.permute(y, [2,1,3])
-            self.z = np.permute(z, [2,1,3])
-
-            bv = self.getBiasSamples(np.array(np.reshape(x, 1, numPoints**3), 
-                    np.reshape(y, 1, np**3), np.reshape(z, 1, np**3)))
-            self.biasValues = np.reshape(bv, np.array(self.originIndices, 
-                                nPoints, nPoints, nPoints))
+        # TODO: Finish implementing for multidimensional case
         else: # uses exploited symmetry in the bias error
             radius = a*self.radii[1]
             self.r = np.linspace(0,radius,(radius/200))
-            self.biasValues = self.getBiasSamples(np.array(self.r, np.zeros(self.dim-1, len(self.r))))
+            self.bias_values = self.getBiasSamples(np.array([self.r, 
+                                np.zeros(self.dim-1, len(self.r))]))
 
     def createNoiseModel(self):
         """
-        Create noise model for estimating the noise term of the surrogate model;
-        returns the noise generating node
+        Create noise model for estimating the noise term of the surrogate model
+
+        Steps:
+        1. Come up with forier transform parameters
+        2. Calculate the noise based on actual values and bias values (noise = (est - actual) - bias)
+        3.
 
         """
-        T = 2
-        dt = self.dt
-        freqTh = max(2*math.pi*(np.linspace(0,(1/dt/2),1/T)))
-        time = np.arange(dt, T+dt, dt)
-        noiseInp = nengo.Node(WhiteSignal(T, )) 
+        n_totaldim = len(self.origin_indices) # total dim of all origins
+        time = self.trange
+        num_points = 3
+        sim_time = time[-1] # simulated time
+        eval_points = self.__bias_points
 
-        return 
+        # Need bias to calculate noise
+        if len(self.bias_values_est) == 0 or len(self.bias_values_sim) == 0:
+            self.getBiasSamples()
 
-    # 	ndim = len(self.originIndices) # total # of dimensions across origins
-    # 	dt = self.dt;
-    # 	T = 2;
-    # 	time = np.arange(dt, T+dt, dt)
+        actual = self.actual_values
+        ideal = self.ideal_values
+        noise = (ideal-actual)-self.bias_values_sim
+        self.noise_values_sim = noise
+        print "noise: {}".format(noise)
+        
+        freq = 2*math.pi*np.linspace(0,(0.5/self.dt-1/sim_time),1/sim_time, endpoint=True)
+        rho = np.zeros((n_totaldim, n_totaldim)) # correlations
 
-    # 	n = 3
+        # Use LPF to normalize the noise
+    	mags = np.zeros((n_totaldim, len(freq), self.dim)) # fourier magnitudes
+    	points = np.matlib.repmat(np.zeros(eval_points.shape), 1, 2) # TODO: Figureout why these parameters are used
+    	points[0,1] = 2*eval_points[0] # a point at 2*radius
+    	self.sds = np.zeros((n_totaldim, 2)) # standard deviations of the noise; why are we using 2 here.... (# of dimensions perhaps?)
 
-    # 	rho = np.zeros(ndim, ndim) # correlations
-    # 	mags = np.zeros(ndim, len(freq), 2) # fourier magnitudes
-    # 	points = np.repmat(np.zeros(size(self.radii)), 1, 2) 
-    # 	points[1,2] = 2*self.radii(1) # a point at 2*radius
-    # 	self.sds = np.zeros(ndim, 2) # standard deviations of the noise
+    	for i in range(self.dim):
+    		self.sds[:,i] = np.std(noise, [], 2) # need to convert the params somehow....
 
-    # 	for i in range(length(self.radii)):
-    # 		noiseMatrix = self.getNoiseSamples(points[:,i], dt, T)
-    # 		self.sds[:,i] = np.std(noiseMatrix, [], 2) # need to convert the params somehow....
+    		if i == 1:
+    			rho = np.corrcoef(np.transpose(noise))
 
-    # 		if i == 1:
-    # 			rho = np.corrcoef(noiseMatrix.transpose())
+    		for j in range(n_totaldim):
+    			f = np.fft(noise[j,:]) / len(time) * 2 / math.pi**0.5
+    			mags[j,:,i] = np.abs(f[1:len(freq)])
 
-    # 		for j in range(ndim):
-    # 			f = np.fft(noiseMatrix[j,:] / len(time)*2 / math.pi**0.5)
-    # 			mags[j,:,i] = np.abs(f[1:len(freq)])
-
-    # 	self.noiseCorr = rho
+    	self.noiseCorr = rho
 
     # 	# Set up a linear system to filter random noise for noise with realistic spectrum
     # 	self.nfU = np.zeros(ndim, 1)
@@ -187,32 +192,41 @@ class PopulationModeModel(object):
     # 	self.nfC[cp][i,ii] = self.c		
     # 	self.nfD[cp][i,i] = self.d
 
-    def getBias(self, state):
+    def getBiasSamples(self):
         """
-        returns bias based on the population model's state
+        Obtains samples of bias (distortion) error which can then be fit to a 
+        model. Returns an array of bias errors at each eval points for each 
+        origin and an ideal values (ideal). (Note: actual = ideal + bias)
 
-        state: Population state vector
-        bias: a vector of bias values (a static func of the state that is 
-                encoded by the population)
+        Steps:
+        1. Create empty array for bias based on the number of evalPoints
+        2. For every evaluation pointss, calculate bias based on the simulation
+        3. Estimate bias using the simulated bias term; interpolate
         """
-        bias = np.zeros(length(self.originIndices))
-        dim = len(state)
-        if dim == 1:
-            xInd = np.where(self.x, state[0])
-        elif dim == 2:
-            xInd = np.where(self.x, state[0])
-            yInd = np.where(self.y, state[1])
-            bias = self.biasValues[:,xInd,yInd,zInd]
-        elif dim == 3:
-            xInd = np.where(self.x, state[0])
-            yInd = np.where(self.y, state[1])
-            zInd = np.where(self.z, state[2])
-            bias = self.biasValues[:,xInd,yInd,zInd]
-        else:
-            rInd = np.where(self.r, np.norm(state))
-            bias = self.biasValues[:,rInd]
+        eval_points = self.__bias_points
+        bias = np.zeros(eval_points.T.shape)
+        self.calcNeuralActivities()
+        actual = self.actual_values
+        ideal = self.ideal_values
 
-        return bias
+        for i in range(len(self.origins)):
+            origin = self.origins[i]
+            ind = np.where(self.origin_indices == i)
+            bias[ind,:] = actual[ind,:] - ideal[ind,:]
+
+        self.bias_values_sim = bias
+
+        if self.dim == 1:
+            points = np.squeeze(eval_points)
+            bias_vals = np.squeeze(bias)
+            func = interp1d(points, bias)
+
+            new_points = self.genRandomPoints(points)
+            # print "points: {}".format(points)
+            # print"new_points: {}".format(new_points)
+            self.bias_values_est = func(new_points)[0]
+        # elif self.dim == 2:
+        #     self.bias_values_est = interp2d()
 
     def getNoise(self, time):
         """
@@ -273,31 +287,9 @@ class PopulationModeModel(object):
 
         return noise
 
-    def getBiasSamples(self):
+    def getNoiseSamples(self, dt, T):
         """
-        Obtains samples of bias (distortion) error which can then be fit to a 
-        model. Returns an array of bias errors at each eval points for each 
-        origin (bias) and an ideal values (ideal). Note that actual=ideal+bias
-
-        originInd: a vector the same length as the sum of dimensions of all 
-        origins, that speicfies the origin to which each bias element belongs.
-        evalPoints: population states at which bias is sampled(dim x #points)
-        """
-        evalPoints = self.x
-        rates = self.getRates(self.pop, evalPoints, 0,0)
-        bias = np.zeros(len(self.originIndices), size(evalPoints,2))
-        ideal = np.zeros(size(bias))
-        for i in range(1,len(self.pop.origins)):
-            origin = self.pop.origins[i]
-            ind = np.where(self.originIndices == i)
-            # ideal[ind,:] = # origin.f(evalPoints)
-            actual = origin.decoder * rates
-            bias[ind,:] = actual - ideal[ind,:]
-
-    def getNoiseSamples(self, evalPoint, dt, T):
-        """
-        Obtains samples of time-varying noise that specifies the origin to which
-        each bias element belongs. Each element is the index of an origin. 
+        Obtains samples of time-varying noise.
         Returns noise, a cell array of noise samples per origin 
 
         originInd: a vector with same length as the sum of dimensions of all
@@ -311,53 +303,68 @@ class PopulationModeModel(object):
         p = self.pop
 
         if not evalPoint:
-            evalPoint = np.zeros(size(p.radii))
+            evalPoint = np.zeros(self.__bias_points)
 
-        time= np.arange(dt,T+dt, dt)
-        noise = np.zeros(len(self.originIndices), len(time))
+        time = self.trange
+        sim_time = time[-1] # simulated time
+        eval_points = self.__bias_points
+        noise = np.zeros((len(self.originIndices), len(time)))
 
-        drive = getDrive(p, evalPoint)
-        reset(p) #TODO: fix this
+        drive = self.__drive
         for i in range(len(time)):
-            activity = run(p.spikeGenerator, drive, time[i]-dt, time[i], 1) #TODO: FIX THIS CUZ NEF HAS ITS OWN ENSEMBLE
+            activity = run(p.spikeGenerator, drive, time[i]-dt, time[i], 1) 
             for j in range(len(p.origins)):
                 setActivity(p.origins[j], time[i], activity) #TODO
                 noise[self.originIndices == j,i] = getOutput(p.origins[j])
 
         [bias, ideal] = self.getBiasSamples(evalPoint)
-        noise = noise - np.repmat(ideal + bias, 1, len(time))
+        noise = noise - np.matlib.repmat(ideal + bias, 1, len(time))
 
+    def genRandomPoints(self, orig_points):
+        """
+        generates a new set of points based on the original set of points; assume that you want same number of points as
+        original points
 
+        """
+        # directions = np.random.randn(self.dim, len(orig_points))
+        # directions = np.sort(directions)
+        # print "directions: {}".format(directions)
+        # mag_direct = (np.sum(directions**2, 1))**0.5
+        # mag_orig = (np.sum(orig_points**2, 0))**0.5
+        # print "mag_direct: {}".format(mag_direct)
+        # print "mag_orig: {}".format(mag_orig)
+        # unit_points = directions / mag_direct * orig_points
+        # print "unit_points: {}".format(unit_points)
+        # # points = unit_points * (np.ones(orig_points.shape) * np.random.uniform(1,
+        # #             len(orig_points))**(1/self.dim))
+        # points = unit_points * orig_points
+        # print "points: {}".format(points)
 
+        # offsets = np.zeros(orig_points.shape)
+        # points = offsets * np.ones(orig_points.shape) + points
+        # dt = abs(orig_points[0] - orig_points[-1]) / len(orig_points) 
+        points = np.linspace(orig_points[0], orig_points[-1], 2*len(orig_points), endpoint=True)
+        new_points = points[1::2]
 
+        # print "orig_points: {}".format(orig_points)
+        # print "new_points: {}".format(new_points)
+        return new_points
 
+    def calcNeuralActivities(self):
+        """
+        Calculates the neural activity by performing dot product in between
+        the decoding vector and the rates.
+        """
+        eval_points = self.__bias_points
+        bias = np.zeros(eval_points.T.shape)
+        decoders_pre = self.__decoders[0]
+        decoders_post = self.__decoders[1]
+        rates_pre = self.__rates[0]
+        rates_post = self.__rates[1]
 
+        actual = np.tensordot(decoders_post,rates_post, axes=([-1],[0]))
+        ideal = np.tensordot(decoders_pre, rates_pre, axes=([-1],[0]))
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        self.actual_values = actual
+        self.ideal_values = ideal
+        
